@@ -1,0 +1,637 @@
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Consumer;
+
+
+// Для создания моков и т.д.
+//import org.mockito.Mockito;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+
+
+class CustomThreadPoolTest { // Переименовано для соответствия структуре проекта
+
+    private Observable.IOThreadScheduler ioScheduler;
+    private Observable.ComputationScheduler computationScheduler;
+    private Observable.SingleThreadScheduler singleScheduler;
+
+    @BeforeEach
+    void setUp() {
+        ioScheduler = new Observable.IOThreadScheduler();
+        computationScheduler = new Observable.ComputationScheduler();
+        singleScheduler = new Observable.SingleThreadScheduler();
+    }
+
+    @AfterEach
+    void tearDown() {
+        ioScheduler.shutdown();
+        computationScheduler.shutdown();
+        singleScheduler.shutdown();
+    }
+
+
+    // 1. Тесты для базовых компонентов (Observer, Observable, create, subscribe)
+
+    @Test
+    void testObserverMethodsCalled() {
+        // Arrange
+        Observer<String> observer = mock(Observer.class);
+        Observable<String> observable = Observable.create(obs -> {
+            obs.onNext("Hello");
+            obs.onNext("World");
+            obs.onComplete();
+        });
+
+        // Act
+        observable.subscribe(observer);
+
+        // Assert
+        verify(observer, times(2)).onNext(anyString());
+        verify(observer, times(1)).onComplete();
+        verify(observer, never()).onError(any(Throwable.class));
+    }
+
+    @Test
+    void testOnErrorCalled() {
+        // Arrange
+        Observer<Integer> observer = mock(Observer.class);
+        Observable<Integer> observable = Observable.create(observer -> {
+            observer.onNext(1);
+            observer.onError(new RuntimeException("Test error"));
+            observer.onNext(2); // Должно быть проигнорировано
+        });
+
+        // Act
+        observable.subscribe(observer);
+
+        // Assert
+        verify(observer, times(1)).onNext(1);
+        verify(observer, times(1)).onError(any(RuntimeException.class));
+        verify(observer, never()).onNext(2);
+        verify(observer, never()).onComplete();
+    }
+
+    @Test
+    void testCreateWithConsumer() {
+        // Arrange
+        Observer<String> observer = mock(Observer.class);
+        Observable<String> observable = Observable.create(obs -> {
+            obs.onNext("Test");
+            obs.onComplete();
+        });
+
+        // Act
+        observable.subscribe(observer);
+
+        // Assert
+        verify(observer, times(1)).onNext("Test");
+        verify(observer, times(1)).onComplete();
+    }
+
+    @Test
+    void testSubscribeWithNullObserver() {
+        // Arrange
+        Observable<String> observable = Observable.create(observer -> { /* ... */ });
+
+        // Act & Assert
+        assertThrows(NullPointerException.class, () -> observable.subscribe(null));
+    }
+
+    // 2. Тесты для операторов map, filter, doOnNext
+
+    @Test
+    void testMapOperator() {
+        // Arrange
+        Observer<Integer> observer = mock(Observer.class);
+        Observable<String> observable = Observable.create(obs -> {
+            obs.onNext("1");
+            obs.onNext("2");
+            obs.onComplete();
+        });
+
+        // Act
+        observable.map(Integer::parseInt).subscribe(observer);
+
+        // Assert
+        verify(observer, times(1)).onNext(1);
+        verify(observer, times(1)).onNext(2);
+        verify(observer, times(1)).onComplete();
+    }
+
+    @Test
+    void testMapOperatorWithErrorHandling() {
+        // Arrange
+        Observer<Integer> observer = mock(Observer.class);
+        Observable<String> observable = Observable.create(obs -> {
+            obs.onNext("1");
+            obs.onNext("abc"); //  Попытка преобразовать строку, которая вызовет ошибку
+            obs.onComplete(); // Должно быть проигнорировано
+        });
+
+        // Act
+        observable.map(Integer::parseInt).subscribe(observer);
+
+        // Assert
+        verify(observer, times(1)).onNext(1);
+        verify(observer, times(1)).onError(any(NumberFormatException.class));
+        verify(observer, never()).onComplete();
+    }
+
+
+    @Test
+    void testFilterOperator() {
+        // Arrange
+        Observer<Integer> observer = mock(Observer.class);
+        Observable<Integer> observable = Observable.create(obs -> {
+            obs.onNext(1);
+            obs.onNext(2);
+            obs.onNext(3);
+            obs.onComplete();
+        });
+
+        // Act
+        observable.filter(x -> x % 2 == 0).subscribe(observer);
+
+        // Assert
+        verify(observer, times(1)).onNext(2);
+        verify(observer, times(1)).onComplete();
+        verify(observer, never()).onNext(1);
+        verify(observer, never()).onNext(3);
+    }
+
+    @Test
+    void testFilterOperatorWithErrorHandling() {
+        // Arrange
+        Observer<Integer> observer = mock(Observer.class);
+        Observable<Integer> observable = Observable.create(obs -> {
+            obs.onNext(1);
+            obs.onNext(2);
+            obs.onNext(3);
+            obs.onComplete();
+        });
+        // Act & Assert
+        observable.filter(x -> {
+            if (x == 2) {
+                throw new RuntimeException("Test filter error");
+            }
+            return x % 2 == 0;
+        }).subscribe(observer);
+
+        verify(observer, never()).onNext(2);
+        verify(observer, times(1)).onError(any(RuntimeException.class));
+        verify(observer, never()).onComplete();
+        verify(observer, times(1)).onNext(0); // 0 because no elements are emitted.
+    }
+
+
+    @Test
+    void testDoOnNextOperator() {
+        // Arrange
+        Observer<Integer> observer = mock(Observer.class);
+        Consumer<Integer> consumer = mock(Consumer.class);
+        Observable<Integer> observable = Observable.create(obs -> {
+            obs.onNext(1);
+            obs.onNext(2);
+            obs.onComplete();
+        });
+
+        // Act
+        observable.doOnNext(consumer).subscribe(observer);
+
+        // Assert
+        verify(consumer, times(1)).accept(1);
+        verify(consumer, times(1)).accept(2);
+        verify(observer, times(1)).onNext(1);
+        verify(observer, times(1)).onNext(2);
+        verify(observer, times(1)).onComplete();
+    }
+
+    @Test
+    void testDoOnNextOperatorWithErrorHandling() {
+        // Arrange
+        Observer<Integer> observer = mock(Observer.class);
+        Observable<Integer> observable = Observable.create(obs -> {
+            obs.onNext(1);
+            obs.onNext(2);
+            obs.onComplete();
+        });
+
+        // Act & Assert
+        observable.doOnNext(x -> {
+            if (x == 2) {
+                throw new RuntimeException("Test doOnNext error");
+            }
+        }).subscribe(observer);
+
+        verify(observer, times(1)).onNext(1);
+        verify(observer, times(1)).onError(any(RuntimeException.class));
+        verify(observer, never()).onNext(2);
+        verify(observer, never()).onComplete();
+    }
+
+    // 3. Тесты для Schedulers
+
+    @Test
+    void testIOScheduler() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1);
+        Observer<String> observer = new Observer<>() {
+            @Override
+            public void onNext(String item) {
+                System.out.println("IOThread Received: " + item + " in " + Thread.currentThread().getName());
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                fail("Error: " + t.getMessage());
+            }
+
+            @Override
+            public void onComplete() {
+                latch.countDown();
+            }
+        };
+        Observable<String> observable = Observable.create(obs -> {
+            obs.onNext("Hello");
+            obs.onComplete();
+        });
+
+        // Act
+        observable.subscribeOn(ioScheduler).subscribe(observer);
+
+        // Assert
+        assertTrue(latch.await(5, TimeUnit.SECONDS), "Timeout waiting for completion");
+    }
+
+    @Test
+    void testComputationScheduler() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1);
+        Observer<String> observer = new Observer<>() {
+            @Override
+            public void onNext(String item) {
+                System.out.println("Computation Received: " + item + " in " + Thread.currentThread().getName());
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                fail("Error: " + t.getMessage());
+            }
+
+            @Override
+            public void onComplete() {
+                latch.countDown();
+            }
+        };
+        Observable<String> observable = Observable.create(obs -> {
+            obs.onNext("World");
+            obs.onComplete();
+        });
+
+        // Act
+        observable.subscribeOn(computationScheduler).subscribe(observer);
+
+        // Assert
+        assertTrue(latch.await(5, TimeUnit.SECONDS), "Timeout waiting for completion");
+    }
+
+    @Test
+    void testSingleThreadScheduler() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1);
+        Observer<String> observer = new Observer<>() {
+            @Override
+            public void onNext(String item) {
+                System.out.println("SingleThread Received: " + item + " in " + Thread.currentThread().getName());
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                fail("Error: " + t.getMessage());
+            }
+
+            @Override
+            public void onComplete() {
+                latch.countDown();
+            }
+        };
+        Observable<String> observable = Observable.create(obs -> {
+            obs.onNext("!");
+            obs.onComplete();
+        });
+
+        // Act
+        observable.subscribeOn(singleScheduler).subscribe(observer);
+
+        // Assert
+        assertTrue(latch.await(5, TimeUnit.SECONDS), "Timeout waiting for completion");
+    }
+
+
+    @Test
+    void testObserveOn() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1);
+        String[] threadName = new String[1]; //  Сохраняем имя потока
+        Observer<String> observer = new Observer<>() {
+            @Override
+            public void onNext(String item) {
+                threadName[0] = Thread.currentThread().getName(); //  Записываем имя текущего потока
+                System.out.println("ObserveOn Received: " + item + " in " + threadName[0]);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                fail("Error: " + t.getMessage());
+            }
+
+            @Override
+            public void onComplete() {
+                latch.countDown();
+            }
+        };
+        Observable<String> observable = Observable.create(obs -> {
+            obs.onNext("Test");
+            obs.onComplete();
+        });
+
+        // Act
+        observable.observeOn(ioScheduler).subscribe(observer); // observeOn должен переключить на IO потоки
+
+        // Assert
+        assertTrue(latch.await(5, TimeUnit.SECONDS), "Timeout waiting for completion");
+        assertTrue(threadName[0] != null && threadName[0].startsWith("CustomThreadPool-worker-"), "Not executed in a thread from IOThreadScheduler");
+    }
+
+    @Test
+    void testSubscribeOnAndObserveOn() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1);
+        String[] subscribeThreadName = new String[1];
+        String[] observeThreadName = new String[1];
+
+        Observer<String> observer = new Observer<>() {
+            @Override
+            public void onNext(String item) {
+                observeThreadName[0] = Thread.currentThread().getName();
+                System.out.println("Received: " + item + " in " + observeThreadName[0]);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                fail("Error: " + t.getMessage());
+            }
+
+            @Override
+            public void onComplete() {
+                latch.countDown();
+            }
+        };
+
+        Observable<String> observable = Observable.create(obs -> {
+            subscribeThreadName[0] = Thread.currentThread().getName(); // Записываем имя потока, в котором создается Observable
+            System.out.println("Emitting in " + subscribeThreadName[0]);
+            obs.onNext("Test");
+            obs.onComplete();
+        });
+
+        // Act
+        observable.subscribeOn(ioScheduler)
+                .observeOn(computationScheduler)
+                .subscribe(observer);
+
+        // Assert
+        assertTrue(latch.await(5, TimeUnit.SECONDS), "Timeout waiting for completion");
+        assertTrue(subscribeThreadName[0] != null && subscribeThreadName[0].startsWith("CustomThreadPool-worker-"), "Not executed in a thread from IOThreadScheduler");
+        assertTrue(observeThreadName[0] != null && observeThreadName[0].startsWith("CustomThreadPool-worker-"), "Not executed in a thread from ComputationScheduler");
+        assertNotEquals(subscribeThreadName[0], observeThreadName[0], "SubscribeOn and ObserveOn should use different threads."); // Проверяем, что потоки разные.
+    }
+
+
+
+    // 4. Тесты для дополнительных операторов и отмены подписки (flatMap)
+
+    @Test
+    void testFlatMapOperator() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(3); //  Ожидаем 3 элемента
+        Observer<Integer> observer = new Observer<>() {
+            @Override
+            public void onNext(Integer item) {
+                System.out.println("FlatMap Received: " + item + " in " + Thread.currentThread().getName());
+                latch.countDown();
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                fail("FlatMap Error: " + t.getMessage());
+            }
+
+            @Override
+            public void onComplete() {
+                //  Не вызываем, так как обработка завершения зависит от внутренних Observables
+            }
+        };
+
+        Observable<Integer> sourceObservable = Observable.create(obs -> {
+            obs.onNext(1);
+            obs.onNext(2);
+            obs.onNext(3);
+            obs.onComplete();
+        });
+
+
+        // Act
+        sourceObservable.flatMap(item -> Observable.create(innerObs -> {
+                    innerObs.onNext(item * 10);
+                    innerObs.onComplete();
+                }))
+                .subscribe(observer);
+        // Assert
+        assertTrue(latch.await(5, TimeUnit.SECONDS), "Timeout waiting for completion");
+    }
+
+
+    @Test
+    void testFlatMapOperatorWithErrorHandling() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1); //  Ожидаем ошибку
+        Observer<Integer> observer = new Observer<>() {
+            @Override
+            public void onNext(Integer item) {
+                System.out.println("Received: " + item);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                System.err.println("Error: " + t.getMessage());
+                latch.countDown(); // Сообщаем об ошибке
+            }
+
+            @Override
+            public void onComplete() {
+                fail("Should not complete");
+            }
+        };
+
+        Observable<Integer> sourceObservable = Observable.create(obs -> {
+            obs.onNext(1);
+            obs.onNext(2); // Генерируем ошибку
+            obs.onComplete();
+        });
+
+        // Act
+        sourceObservable.flatMap(item -> Observable.create(innerObs -> {
+                    if (item == 2) {
+                        innerObs.onError(new RuntimeException("FlatMap test error"));
+                    } else {
+                        innerObs.onNext(item * 10);
+                        innerObs.onComplete();
+                    }
+                }))
+                .subscribe(observer);
+
+        // Assert
+        assertTrue(latch.await(5, TimeUnit.SECONDS), "Timeout waiting for completion");
+    }
+
+
+
+    @Test
+    void testDisposeSubscription() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1);
+        Observable<Integer> observable = Observable.create(observer -> {
+            for (int i = 0; i < 5; i++) {
+                try {
+                    Thread.sleep(20); //  Имитация работы
+                    observer.onNext(i);
+                    System.out.println("Emitting " + i + " in " + Thread.currentThread().getName());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    System.out.println("Interrupted");
+                    break;
+                }
+            }
+            observer.onComplete();
+        });
+
+        Observer<Integer> observer = new Observer<>() {
+            private int count = 0;
+            @Override
+            public void onNext(Integer item) {
+                System.out.println("Received (cancellable): " + item);
+                count++;
+                if (count >= 2) {
+                  latch.countDown();
+                }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                fail("Error (cancellable): " + t.getMessage());
+            }
+
+            @Override
+            public void onComplete() {
+                System.out.println("Completed (cancellable)");
+            }
+        };
+
+        // Act
+        Disposable disposable = observable.subscribe(observer);
+        Thread.sleep(40); // Даем немного времени для эмиссии 2 элементов
+        disposable.dispose(); // Отменяем подписку
+
+        // Assert
+        assertTrue(latch.await(1, TimeUnit.SECONDS)); //  Должно быть получено только 2 элемента.
+    }
+
+    @Test
+    void testDisposeSubscriptionOnError() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1);
+
+        Observable<Integer> observable = Observable.create(observer -> {
+            observer.onNext(1);
+            observer.onError(new RuntimeException("Test Error"));
+            observer.onNext(2); // This should not be emitted
+        });
+
+        Observer<Integer> observer = new Observer<>() {
+            @Override
+            public void onNext(Integer item) {
+                System.out.println("Received (cancellable): " + item);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                System.err.println("Error (cancellable): " + t.getMessage());
+                latch.countDown();
+            }
+
+            @Override
+            public void onComplete() {
+                fail("Should not complete");
+            }
+        };
+
+        // Act
+        Disposable disposable = observable.subscribe(observer);
+        Thread.sleep(50);  // Give some time to emit
+
+        // Assert
+        assertTrue(latch.await(1, TimeUnit.SECONDS));
+        assertTrue(disposable.isDisposed());
+
+    }
+
+    @Test
+    void testDisposeSubscriptionOnComplete() throws InterruptedException {
+        // Arrange
+        CountDownLatch latch = new CountDownLatch(1);
+
+        Observable<Integer> observable = Observable.create(observer -> {
+            observer.onNext(1);
+            observer.onComplete();
+            observer.onNext(2); // This should not be emitted
+        });
+
+        Observer<Integer> observer = new Observer<>() {
+            @Override
+            public void onNext(Integer item) {
+                System.out.println("Received (cancellable): " + item);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                fail("Error (cancellable): " + t.getMessage());
+            }
+
+            @Override
+            public void onComplete() {
+                System.out.println("Completed");
+                latch.countDown();
+            }
+        };
+
+        // Act
+        Disposable disposable = observable.subscribe(observer);
+        Thread.sleep(50);  // Give some time to emit
+
+        // Assert
+        assertTrue(latch.await(1, TimeUnit.SECONDS));
+        assertTrue(disposable.isDisposed());
+    }
+
+}
